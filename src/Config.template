@@ -1,0 +1,18 @@
+{-# LANGUAGE OverloadedStrings #-}
+
+module Config where
+
+import qualified Data.ByteString as BS
+import Data.Text
+import GitHub.Data.Name
+import qualified GitHub.Data.Definitions as Github
+import qualified GitHub.Data.Repos as Github
+
+asanaToken :: String
+asanaToken = ""
+
+gitHubToken :: BS.ByteString
+gitHubToken = ""
+
+targetRepo :: (Name Github.Owner, Name Github.Repo)
+targetRepo = ("saurabhnanda", "test-repo3")

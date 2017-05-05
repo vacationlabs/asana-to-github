@@ -9,9 +9,8 @@ import qualified Data.ByteString.Lazy as BSL
 main :: IO ()
 main = do
   contents <- BSL.readFile "issues.json"
-  case (eitherDecode contents :: Either String Data) of
+  case (eitherDecode contents :: Either String (Data Task)) of
     Right dt -> do
-      let csv = CSV.encode $ _dataData dt
-      putStr $ show $ csv
-      BSL.writeFile "output.csv" csv
+      issues <- doImport $ _dataData dt
+      putStrLn $ show issues
     Left e -> putStrLn $ show e
