@@ -98,8 +98,7 @@ data Membership = Membership
 
 data Story = Story
   { _storyCreated_by :: Developer
-  , _storyCreated_at :: Maybe T.Text
-  , _storyText :: Maybe T.Text
+  , _storyHtml_text :: Maybe T.Text
   , _storyType :: T.Text
   } deriving (Generic, Show)
 
@@ -258,12 +257,12 @@ getCommentsForTask task = do
     Nothing -> return ["Failed to fetch comments"]
 
 makeCommentText :: Story -> T.Text
-makeCommentText story = [qc|{(_storyCreated_by story ^. name)} : {fromMaybe "Comment content not found" (_storyText story)}|]
+makeCommentText story = [qc|{(_storyCreated_by story ^. name :: T.Text)} : {fromMaybe "Comment content not found" (_storyHtml_text story)}|]
       
 getStoriesForTask :: Task -> RetryStatus -> IO (Maybe [Story])
 getStoriesForTask task rs = catch (do
   putStrLn $ "Getting stories : Attempt :"  Prelude.++  (show $ rsIterNumber rs)
-  r <- (getEndpoint [qc|/tasks/{task ^. id}/stories|]) 
+  r <- (getEndpoint [qc|/tasks/{task ^. id}/stories?opt_fields=html_text,created_by.id,created_by.name,type|]) 
   return $ Just $ _dataData $ fromJust $ decode $ r ^. responseBody) handler 
   where
   handler :: SomeException -> IO (Maybe [Story])

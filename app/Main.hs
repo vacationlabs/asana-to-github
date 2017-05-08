@@ -12,7 +12,7 @@ main = do
   contents <- BSL.readFile "issues.json"
   case (eitherDecode contents :: Either String (Data Task)) of
     Right dt -> do
-      --issues <- doImport $ filter (\a -> a ^. Lib.id ==  47822546634645) (_dataData dt)  
+      -- issues <- doImport $ filter (\a -> a ^. Lib.id == 137062593908845) (_dataData dt)  
       issues <- doImport (_dataData dt)  
       putStrLn $ show issues
     Left e -> putStrLn $ show e
