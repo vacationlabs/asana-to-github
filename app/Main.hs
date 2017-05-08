@@ -16,5 +16,3 @@ main = do
       issues <- doImport (_dataData dt)  
       putStrLn $ show issues
     Left e -> putStrLn $ show e
-
--- 909  316
