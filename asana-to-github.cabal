@@ -31,6 +31,8 @@ library
                        , text
                        , github
                        , containers
+                       , async
+                       , split
   default-language:    Haskell2010
 
 executable asana-to-github-exe
@@ -49,6 +51,9 @@ executable asana-to-github-exe
                      , text
                      , github
                      , containers
+                     , lens
+                     , async
+                     , split
   default-language:    Haskell2010
 
 test-suite asana-to-github-test

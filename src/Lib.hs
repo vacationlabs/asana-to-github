@@ -34,13 +34,15 @@ import qualified GitHub.Endpoints.Issues.Comments as Github
 import qualified GitHub.Data.Definitions as Github
 import qualified GitHub.Data.Id as Id
 import GitHub.Data.Name
-import Data.Vector hiding (foldM, mapM_)
+import Data.Vector hiding (foldM, mapM_, mapM)
 import qualified Data.Text as T
 import Prelude hiding (id)
 import qualified GitHub as GH
 import Control.Exception
 import Control.Retry
 import Control.Monad
+import Data.List.Split
+import Control.Concurrent.Async
 
 fieldNamer = (aesonPrefix lcaseFirst)
   where
@@ -173,7 +175,7 @@ collectTasks tasks taskId = collectTasks' taskId
       task = findTask taskId
       in task:(Prelude.concat $ collectTasks' <$> ((^. id) <$> (fromMaybe [] (task ^. subtasks))))
 
-doImport :: [Task] -> IO TidIssueAssoc
+doImport :: [Task] -> IO [Github.Issue]
 doImport tasks = do
   assoc <- importTasks tasks
   return assoc
@@ -202,25 +204,28 @@ appendMessage issue message = do
     edit = Github.editOfIssue { Github.editIssueBody = newMessage }
   editIssue issue edit
 
-importTasks :: [Task] -> IO TidIssueAssoc
-importTasks tasks = foldM importAndAssociate DM.empty tasks
+importTasks :: [Task] -> IO [Github.Issue]
+importTasks tasks = Prelude.concat <$> (mapM importTasks' $ chunksOf 40 tasks)
   where
-    importAndAssociateSubtask :: Github.Issue -> TidIssueAssoc -> Task -> IO TidIssueAssoc
-    importAndAssociateSubtask parent map task = do
-      let msg = [qc|This is a sub task of #{Github.issueNumber parent}.|]
-          newTask = task & notes .~ ((\note -> T.concat [msg, "\n", note]) <$> (task ^. notes))
-        in importAndAssociate map newTask
-    importAndAssociate :: TidIssueAssoc -> Task -> IO TidIssueAssoc
-    importAndAssociate map task = do
-      maybeIssue <- importTask task
-      case maybeIssue of
-        Just issue -> case task ^. subtasks of
-          Just subtasks_@(_:_) -> do
-            subIssueMap <- foldM (importAndAssociateSubtask issue) DM.empty subtasks_
-            linkParentTask issue (DM.elems subIssueMap)
-            return $ DM.union (DM.insert (task ^. id) issue map) subIssueMap
-          _ -> return $ DM.insert (task ^. id) issue map
-        Nothing -> return map
+  importTasks' :: [Task] -> IO [Github.Issue]
+  importTasks' tasks = Prelude.concat <$> mapConcurrently importTask' tasks
+    where
+      importSubtask :: Github.Issue -> Task -> IO [Github.Issue]
+      importSubtask parent task = do
+        let msg = [qc|This is a sub task of #{Github.issueNumber parent}.|]
+            newTask = task & notes .~ ((\note -> T.concat [msg, "\n", note]) <$> (task ^. notes))
+          in importTask' newTask
+      importTask' :: Task -> IO [Github.Issue]
+      importTask' task = do
+        maybeIssue <- importTask task
+        case maybeIssue of
+          Just issue -> case task ^. subtasks of
+            Just subtasks_@(_:_) -> do
+              subIssues <- Prelude.concat <$> mapM (importSubtask issue) subtasks_
+              linkParentTask issue subIssues
+              return $ (issue:subIssues)
+            _ -> return [issue]
+          Nothing -> return []
 
 makeTaskUrl :: Task -> T.Text
 makeTaskUrl task = [qc|https://app.asana.com/0/{(fromJust $ task ^. workspace) ^. id}/{task ^. id}|]
