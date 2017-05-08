@@ -27,8 +27,10 @@ library
                        , wreq
                        , interpolatedstring-perl6
                        , vector
+                       , retry
                        , text
                        , github
+                       , containers
   default-language:    Haskell2010
 
 executable asana-to-github-exe
@@ -43,8 +45,10 @@ executable asana-to-github-exe
                      , wreq
                      , interpolatedstring-perl6
                      , vector
+                     , retry
                      , text
                      , github
+                     , containers
   default-language:    Haskell2010
 
 test-suite asana-to-github-test

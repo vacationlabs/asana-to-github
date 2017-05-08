@@ -14,11 +14,13 @@ import Control.Lens
 import Control.Lens.TH
 import Data.Aeson
 import Data.Aeson.Casing
+import qualified Data.Map as DM
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BSL
 import Data.Char
 import Data.Csv hiding (header, decode, Name)
 import Data.Monoid
+import Data.List
 import GHC.Generics (Generic)
 import Network.Wreq
 import qualified Network.Wreq.Session as S
@@ -30,10 +32,15 @@ import qualified GitHub.Data.Issues as Github
 import qualified GitHub.Endpoints.Issues as Github
 import qualified GitHub.Endpoints.Issues.Comments as Github
 import qualified GitHub.Data.Definitions as Github
+import qualified GitHub.Data.Id as Id
 import GitHub.Data.Name
-import Data.Vector
+import Data.Vector hiding (foldM, mapM_)
 import qualified Data.Text as T
 import Prelude hiding (id)
+import qualified GitHub as GH
+import Control.Exception
+import Control.Retry
+import Control.Monad
 
 fieldNamer = (aesonPrefix lcaseFirst)
   where
@@ -130,6 +137,8 @@ data Data a = Data
 
 makeLensesWith abbreviatedFields ''Developer
 
+makeLensesWith abbreviatedFields ''Workspace
+
 makeLensesWith abbreviatedFields ''Task
 
 makeLensesWith abbreviatedFields ''Tag
@@ -149,39 +158,148 @@ instance ToField [Tag] where
 instance ToRecord Task where
   toRecord task = record [toField (task ^. name), toField (task ^. notes), toField (task ^. tags)]
 
-doImport :: [Task] -> IO [Github.Issue]
-doImport tasks = Prelude.mapM importTask tasks
+type TidIssueAssoc = DM.Map Int Github.Issue
 
-importTask :: Task -> IO Github.Issue
+collectTasks :: [Task] -> Int -> [Task]
+collectTasks tasks taskId = collectTasks' taskId
+  where
+  findTask :: Int -> Task
+  findTask taskId = case Data.List.find (\t -> t ^. id == taskId) tasks of
+    Just task -> task
+    Nothing -> error $ "Task not found" Prelude.++ (show taskId)
+  collectTasks' :: Int -> [Task]
+  collectTasks' taskId =
+    let
+      task = findTask taskId
+      in task:(Prelude.concat $ collectTasks' <$> ((^. id) <$> (fromMaybe [] (task ^. subtasks))))
+
+doImport :: [Task] -> IO TidIssueAssoc
+doImport tasks = do
+  assoc <- importTasks tasks
+  return assoc
+
+linkParentTask :: Github.Issue -> [Github.Issue] -> IO (Maybe Github.Issue)
+linkParentTask issue subissues = do
+  let subIssueNumbers = T.intercalate ", " $ (T.pack.(\x -> '#':x).show.Github.issueNumber) <$> subissues
+  putStrLn [qc|Linking parent task {Github.issueId issue} with {subIssueNumbers}|]
+  appendMessage issue [qc|This task is a parent of {subIssueNumbers}|]
+
+data CreatedIssueNotFoundException = CreatedIssueNotFoundException deriving (Show)
+
+instance Exception CreatedIssueNotFoundException
+
+safeLookupIssue :: TidIssueAssoc -> Task -> Github.Issue
+safeLookupIssue map task = do
+  let maybeIssue = DM.lookup (task ^. id) map
+  case maybeIssue of
+    Just issue -> issue
+    Nothing -> throw CreatedIssueNotFoundException
+
+appendMessage :: Github.Issue -> T.Text -> IO (Maybe Github.Issue)
+appendMessage issue message = do
+  let
+    newMessage = (\oldmessage -> T.concat [message, "\n", oldmessage]) <$> Github.issueBody issue
+    edit = Github.editOfIssue { Github.editIssueBody = newMessage }
+  editIssue issue edit
+
+importTasks :: [Task] -> IO TidIssueAssoc
+importTasks tasks = foldM importAndAssociate DM.empty tasks
+  where
+    importAndAssociateSubtask :: Github.Issue -> TidIssueAssoc -> Task -> IO TidIssueAssoc
+    importAndAssociateSubtask parent map task = do
+      let msg = [qc|This is a sub task of #{Github.issueNumber parent}.|]
+          newTask = task & notes .~ ((\note -> T.concat [msg, "\n", note]) <$> (task ^. notes))
+        in importAndAssociate map newTask
+    importAndAssociate :: TidIssueAssoc -> Task -> IO TidIssueAssoc
+    importAndAssociate map task = do
+      maybeIssue <- importTask task
+      case maybeIssue of
+        Just issue -> case task ^. subtasks of
+          Just subtasks_@(_:_) -> do
+            subIssueMap <- foldM (importAndAssociateSubtask issue) DM.empty subtasks_
+            linkParentTask issue (DM.elems subIssueMap)
+            return $ DM.union (DM.insert (task ^. id) issue map) subIssueMap
+          _ -> return $ DM.insert (task ^. id) issue map
+        Nothing -> return map
+
+makeTaskUrl :: Task -> T.Text
+makeTaskUrl task = [qc|https://app.asana.com/0/{(fromJust $ task ^. workspace) ^. id}/{task ^. id}|]
+
+rtPolicy = (exponentialBackoff 1000000) <> (limitRetries 30)
+
+importTask :: Task -> IO (Maybe Github.Issue)
 importTask task = do
-  comments <- Prelude.filter (\a -> _storyType a == "comment") <$> getStoriesForTask task
-  issue <- createGitHubIssue task
-  Prelude.mapM (createComment issue) comments
---   case task ^. assignee of
---     Just dev -> addAssignee issue  (dev ^. name)
---     Nothing -> return ()
-  return issue
+  putStrLn $ "Importing task" Prelude.++ (show (task ^. id))
+  comments <- getCommentsForTask task 
+  if task ^. name == "" then return Nothing else do
+    possibleIssue <- createGitHubIssue $ prependOriginalUrl task
+    case possibleIssue of
+      Just issue -> do
+        Prelude.mapM (createComment issue) comments
+        case task ^. completed of
+          Just isCompleted -> if isCompleted then closeIssue issue else return Nothing
+          Nothing -> return Nothing
+        return $ Just issue
+      Nothing -> return Nothing
 
-getStoriesForTask :: Task -> IO [Story]
-getStoriesForTask task = do
+prependOriginalUrl :: Task -> Task
+prependOriginalUrl task = task & notes .~ ((\note -> T.concat [(makeTaskUrl task), "\n", note]) <$> (task ^. notes))
+
+getCommentsForTask :: Task -> IO [T.Text]
+getCommentsForTask task = do
+  maybeStories <- retrying rtPolicy (\rs c -> if isNothing c then return True else return False) $ getStoriesForTask task
+  case maybeStories of
+    Just stories -> return $ ((makeCommentText) <$> (Prelude.filter (\t -> _storyType t == "comment") stories))
+    Nothing -> return ["Failed to fetch comments"]
+
+makeCommentText :: Story -> T.Text
+makeCommentText story = [qc|{(_storyCreated_by story ^. name)} : {fromMaybe "Comment content not found" (_storyText story)}|]
+      
+getStoriesForTask :: Task -> RetryStatus -> IO (Maybe [Story])
+getStoriesForTask task rs = catch (do
+  putStrLn $ "Getting stories : Attempt :"  Prelude.++  (show $ rsIterNumber rs)
   r <- (getEndpoint [qc|/tasks/{task ^. id}/stories|]) 
-  return $ _dataData $ fromJust $ decode $ r ^. responseBody
+  return $ Just $ _dataData $ fromJust $ decode $ r ^. responseBody) handler 
+  where
+  handler :: SomeException -> IO (Maybe [Story])
+  handler e = do
+    putStrLn "Exception while fetching stories"
+    putStrLn $ show e
+    return Nothing
 
 getEndpoint :: String -> IO (Response BSL.ByteString)
 getEndpoint endpoint = let opts = defaults & header "Authorization" .~ [[qc|Bearer {asanaToken}|]]
   in getWith opts [qc|https://app.asana.com/api/1.0{endpoint}|]
 
-createComment :: Github.Issue -> Story -> IO ()
-createComment issue story = do
-  let auth = Github.OAuth gitHubToken
-  case _storyText story of 
-    Just comment -> do
-      Github.createComment auth repoUser repoName (Github.issueId issue) comment
-      return ()
-    Nothing -> return ()
+createComment :: Github.Issue -> T.Text -> IO (Maybe GH.Comment)
+createComment issue comment = 
+  retrying rtPolicy (\rs c -> if isNothing c then return True else return False) $ createComment' issue comment
 
-createGitHubIssue :: Task -> IO (Github.Issue)
-createGitHubIssue task = do
+createComment' :: Github.Issue -> T.Text -> RetryStatus -> IO (Maybe GH.Comment)
+createComment' issue comment rs = do
+  putStrLn $ "Creating comment for issue" Prelude.++ (show (Github.issueId issue)) Prelude.++ " Attempt :"  Prelude.++  (show $ rsIterNumber rs)
+  let auth = Github.OAuth gitHubToken
+  putStrLn $ show $ (Github.issueId issue)
+  putStrLn $ show $ comment
+  possibleComment <- Github.createComment
+    auth
+    repoUser
+    repoName 
+    (Id.Id $ Github.issueNumber issue) -- The Api function expects issue Id here. But github expects issue number. 
+    comment
+  case possibleComment of
+    Right comment -> return $ Just comment
+    Left err      -> do
+      putStrLn "Comment creation failed"
+      putStrLn $ show $ err
+      return Nothing
+
+createGitHubIssue :: Task -> IO (Maybe Github.Issue)
+createGitHubIssue task = retrying rtPolicy (\rs c -> if isNothing c then return True else return False) $ createGitHubIssue' task
+
+createGitHubIssue' :: Task -> RetryStatus -> IO (Maybe Github.Issue)
+createGitHubIssue' task rs = do
+  putStrLn $ "Creating github issue : Attempt :"  Prelude.++  (show $ rsIterNumber rs)
   let
     auth = Github.OAuth gitHubToken
     newiss = Github.NewIssue
@@ -194,14 +312,48 @@ createGitHubIssue task = do
   possibleIssue <- Github.createIssue auth repoUser repoName newiss
   putStrLn $ show possibleIssue
   case possibleIssue of
-    Right issue -> return issue
-    _           -> error "did not create issue"
+    Right issue -> return $ Just issue
+    Left err           -> do
+      putStrLn $ show err
+      return Nothing
+
+editIssue :: Github.Issue -> Github.EditIssue -> IO (Maybe Github.Issue)
+editIssue issue edit = retrying rtPolicy (\rs c -> if isNothing c then return True else return False) $ editIssue' issue edit
+
+editIssue' :: Github.Issue -> Github.EditIssue -> RetryStatus -> IO (Maybe Github.Issue)
+editIssue' issue edit rs = do
+  putStrLn $ "Editing issue" Prelude.++ (show (Github.issueId issue)) Prelude.++ "Attempt :"  Prelude.++  (show $ rsIterNumber rs)
+  let auth = Github.OAuth gitHubToken
+  possibleIssue <- Github.editIssue
+    auth
+    repoUser
+    repoName
+    (Id.Id $ Github.issueNumber issue) -- The Api function expects issue Id here. But github expects issue number. 
+    edit
+  putStrLn $ show possibleIssue
+  case possibleIssue of
+    Right issue -> return $ Just issue
+    Left err           -> do
+      putStrLn $ show err
+      return Nothing
+
+closeIssue :: Github.Issue -> IO (Maybe Github.Issue)
+closeIssue issue = do
+  putStrLn $ "Closing issue" Prelude.++ (show (Github.issueId issue))
+  let edit = Github.editOfIssue { Github.editIssueState = Just GH.StateClosed }
+  editIssue issue edit
 
 addAssignee :: Github.Issue -> T.Text -> IO ()
 addAssignee issue assignee = do
   let auth = Github.OAuth gitHubToken
       edit = Github.editOfIssue { Github.editIssueAssignee = Just $ N assignee }
-  possibleIssue <- Github.editIssue auth repoUser repoName (Github.issueId issue) edit
+  possibleIssue <- Github.editIssue
+    auth
+    repoUser
+    repoName
+    (Id.Id $ Github.issueNumber issue) -- The Api function expects issue Id here. But github expects issue number. 
+    edit
+
   putStrLn $ show possibleIssue
 
 makeNames :: (HasName a T.Text) => Maybe [a] -> Vector (Name b)
